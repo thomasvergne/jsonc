@@ -1,0 +1,8 @@
+[package]
+name = "jsonc-value-opt"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+jsonc-mlir = { path = "../jsonc-mlir" }
+jsonc-object-opt = { path = "../jsonc-object-opt" }
