@@ -1,2 +1,3 @@
 /target
 *.jsonb
+*.bson
