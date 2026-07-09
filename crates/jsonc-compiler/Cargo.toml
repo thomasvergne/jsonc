@@ -1,0 +1,8 @@
+[package]
+name = "jsonc-compiler"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+"jsonc-bytecode" = { path = "../jsonc-bytecode" }
+"jsonc-mlir" = { path = "../jsonc-mlir" }
