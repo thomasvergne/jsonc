@@ -1,0 +1,195 @@
+use std::{collections::HashMap, fmt::Debug};
+
+use serde_json::json;
+
+#[derive(Clone, PartialEq)]
+pub enum MLIR<'a> {
+    String(&'a str),
+    Array(Vec<MLIR<'a>>),
+    Object(Vec<(&'a str, MLIR<'a>)>),
+    Null,
+    Number(f64),
+    Bool(bool),
+
+    // MLIR related nodes
+    Variable(&'a str),
+    FunctionCall {
+        name: &'a str,
+        args: Vec<MLIR<'a>>,
+    },
+    MakeFunction {
+        name: &'a str,
+        params: Vec<&'a str>,
+        body: Box<MLIR<'a>>,
+    },
+
+    Let {
+        name: &'a str,
+        value: Box<MLIR<'a>>,
+    },
+
+    Add {
+        left: Box<MLIR<'a>>,
+        right: Box<MLIR<'a>>,
+    },
+}
+
+impl<'a> Debug for MLIR<'a> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            MLIR::Add { left, right } => {
+                write!(f, "{left:?} + {right:?}")
+            }
+
+            MLIR::Bool(b) => write!(f, "{}", b),
+            MLIR::Number(n) => write!(f, "{}", n),
+            MLIR::String(s) => write!(f, "{:?}", s),
+            MLIR::Null => write!(f, "null"),
+
+            MLIR::Variable(name) => write!(f, "{}", name),
+            MLIR::FunctionCall { name, args } => {
+                write!(f, "{}(", name)?;
+                for (i, arg) in args.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{:?}", arg)?;
+                }
+                write!(f, ")")
+            }
+            MLIR::MakeFunction { name, params, body } => {
+                write!(f, "function {}(", name)?;
+
+                for (i, param) in params.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{}", param)?;
+                }
+                write!(f, ")")?;
+                write!(f, "{{ {:?} }}", body)
+            }
+            MLIR::Let { name, value } => write!(f, "const {} = {:?};", name, value),
+
+            MLIR::Array(elements) => {
+                write!(f, "[")?;
+                for (i, element) in elements.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{:?}", element)?;
+                }
+                write!(f, "]")?;
+                Ok(())
+            }
+            MLIR::Object(pairs) => {
+                write!(f, "{{")?;
+                for (i, (k, v)) in pairs.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{}: {:?}", k, v)?;
+                }
+                write!(f, "}}")?;
+                Ok(())
+            }
+        }
+    }
+}
+
+pub fn from_json<'a>(value: &'a serde_json::Value) -> MLIR<'a> {
+    match value {
+        serde_json::Value::String(s) => MLIR::String(s),
+        serde_json::Value::Array(arr) => {
+            let elements = arr.iter().map(|v| from_json(v)).collect();
+            MLIR::Array(elements)
+        }
+        serde_json::Value::Object(obj) => {
+            let mut pairs = Vec::new();
+            for (k, v) in obj {
+                pairs.push((k.as_str(), from_json(v)));
+            }
+            MLIR::Object(pairs)
+        }
+        serde_json::Value::Null => MLIR::Null,
+        serde_json::Value::Number(n) => MLIR::Number(n.as_f64().unwrap_or(0.0)),
+        serde_json::Value::Bool(b) => MLIR::Bool(*b),
+    }
+}
+
+// Use owned MLIR values in the environment to avoid returning references to temporaries
+pub fn to_json<'a>(mlir: &MLIR<'a>, env: &mut HashMap<&'a str, MLIR<'a>>) -> serde_json::Value {
+    match mlir {
+        MLIR::String(s) => serde_json::Value::String(s.to_string()),
+        MLIR::Array(arr) => serde_json::Value::Array(arr.iter().map(|v| to_json(v, env)).collect()),
+        MLIR::Object(obj) => {
+            let mut map = serde_json::Map::new();
+            for (k, v) in obj {
+                map.insert(k.to_string(), to_json(v, env));
+            }
+            serde_json::Value::Object(map)
+        }
+        MLIR::Null => serde_json::Value::Null,
+        MLIR::Number(n) => json!(*n),
+        MLIR::Bool(b) => serde_json::Value::Bool(*b),
+        MLIR::Variable(name) => {
+            // Clone uniquement la valeur trouvee, pas tout l'env
+            match env.get(*name).cloned() {
+                Some(val) => to_json(&val, env),
+                None => serde_json::Value::Null,
+            }
+        }
+        MLIR::FunctionCall { name, args } => match env.get(*name) {
+            Some(MLIR::MakeFunction { body, params, .. }) => {
+                // clone the environment and insert parameter bindings (owned MLIRs)
+                let mut map = env.clone();
+                for (param, arg) in params.iter().zip(args.iter()) {
+                    map.insert(*param, arg.clone());
+                }
+
+                to_json(&body, &mut map)
+            }
+            _ => serde_json::Value::Null,
+        },
+        MLIR::MakeFunction { params, name, body } => {
+            env.insert(
+                name,
+                MLIR::MakeFunction {
+                    params: params.clone(),
+                    name: *name,
+                    body: body.clone(),
+                },
+            );
+
+            serde_json::Value::Null
+        }
+        MLIR::Let { name, value } => {
+            env.insert(name, *value.clone());
+            serde_json::Value::Null
+        }
+        MLIR::Add { left, right } => match (to_json(left, env), to_json(right, env)) {
+            (serde_json::Value::Number(l), serde_json::Value::Number(r)) => {
+                json!(l.as_f64().unwrap_or(0.0) + r.as_f64().unwrap_or(0.0))
+            }
+            (serde_json::Value::Null, serde_json::Value::Null) => serde_json::Value::Null,
+            (serde_json::Value::Null, _) => serde_json::Value::Null,
+            (_, serde_json::Value::Null) => serde_json::Value::Null,
+            (serde_json::Value::String(s1), serde_json::Value::String(s2)) => {
+                json!(s1.to_string() + &s2)
+            }
+            _ => serde_json::Value::Null,
+        },
+    }
+}
+
+pub fn multiple_to_json<'a>(
+    mlir: &[MLIR<'a>],
+    env: &mut HashMap<&'a str, MLIR<'a>>,
+) -> serde_json::Value {
+    let mut result = serde_json::Value::Null;
+    for expr in mlir {
+        result = to_json(expr, env);
+    }
+
+    result
+}
