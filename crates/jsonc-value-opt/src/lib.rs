@@ -1,14 +1,16 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
-use jsonc_mlir::MLIR;
-use jsonc_object_opt::{IS_ROOT, replace_variable_with_value};
+use jsonc_mlir::{MLIR, debug};
+use jsonc_object_opt::{
+    IS_ROOT, replace_multiple_variables_with_values, replace_variable_with_value,
+};
 
 pub struct ValueOptimizer<'a> {
     pub value_pool: Vec<MLIR<'a>>,
     pub value_counter: HashMap<usize, usize>,
-    pub value_to_drop: Vec<usize>,
-    /// Cache de noms de variables "v0", "v1", evite un Box::leak par appel.
+    pub value_to_drop: HashSet<usize>,
     var_name_cache: Vec<&'static str>,
+    value_indices: HashMap<MLIR<'a>, usize>,
 }
 
 impl<'a> ValueOptimizer<'a> {
@@ -16,12 +18,13 @@ impl<'a> ValueOptimizer<'a> {
         Self {
             value_pool: Vec::new(),
             value_counter: HashMap::new(),
-            value_to_drop: Vec::new(),
+            value_to_drop: HashSet::new(),
             var_name_cache: Vec::new(),
+            value_indices: HashMap::new(),
         }
     }
 
-    /// Retourne et met en cache la chaine statique "v{index}".
+    /// Returns and caches the static string "v{index}".
     fn var_name(&mut self, index: usize) -> &'static str {
         if index < self.var_name_cache.len() {
             return self.var_name_cache[index];
@@ -39,7 +42,6 @@ impl<'a> ValueOptimizer<'a> {
     }
 
     pub fn create_lets(&mut self) -> Vec<MLIR<'a>> {
-        // Collecte d'abord les (index, valeur) pour eviter le conflit d'emprunt
         let entries: Vec<(usize, MLIR<'a>)> = self
             .value_pool
             .iter()
@@ -72,65 +74,75 @@ impl<'a> ValueOptimizer<'a> {
         new_lets
     }
 
-    pub fn optimize_all(&mut self, mlir: &MLIR<'a>) -> MLIR<'a> {
-        let mut optimized = self.optimize(mlir, IS_ROOT);
+    pub fn collect(&mut self, mlir: &MLIR<'a>) -> MLIR<'a> {
+        self.optimize(mlir, IS_ROOT)
+    }
 
+    pub fn optimize_all(&mut self, mlirs: &Vec<MLIR<'a>>) -> Vec<MLIR<'a>> {
+        let mut result = Vec::new();
+        for mlir in mlirs.iter() {
+            debug!("Collecting values...");
+            result.push(self.collect(mlir));
+        }
+        result
+    }
+
+    pub fn optimize_program(&mut self, mut formatted_mlir: Vec<MLIR<'a>>) -> Vec<MLIR<'a>> {
         let mut lets = self.value_pool.clone();
-        let pool_len = self.value_pool.len();
+        let pool_len = lets.len();
 
+        let mut resolved_replacements = HashMap::new();
+        let mut resolved_functions = HashMap::new();
+
+        debug!("Resolving lets sequentially...");
         for index in 0..pool_len {
             let count = *self.value_counter.get(&index).unwrap_or(&0);
 
-            if count <= 1 {
-                // Clone une seule fois depuis le pool original (non modifie)
-                match self.value_pool[index].clone() {
-                    MLIR::MakeFunction { name, body, params } => {
-                        let body_owned = *body;
-                        // Mutation en place : evite l'allocation d'un nouveau Vec par iteration
-                        for v in lets.iter_mut() {
-                            let old = std::mem::replace(v, MLIR::Null);
-                            *v = replace_every_function_call_in(old, name, &body_owned, &params);
-                        }
-                        self.value_to_drop.push(index);
-                    }
+            let old = std::mem::replace(&mut lets[index], MLIR::Null);
+            let val = replace_multiple_variables_with_values(old, &resolved_replacements);
+            let resolved_let = replace_multiple_every_function_call_in(val, &resolved_functions);
 
+            if count <= 1 {
+                self.value_to_drop.insert(index);
+                match &resolved_let {
+                    MLIR::MakeFunction { name, params, body } => {
+                        resolved_functions.insert(*name, (*body.clone(), params.clone()));
+                    }
                     let_value => {
-                        let var_str = self.var_name(index);
-                        // Mutation en place ; val passe par reference, clone seulement si substitution
-                        for v in lets.iter_mut() {
-                            let old = std::mem::replace(v, MLIR::Null);
-                            *v = replace_variable_with_value(&old, var_str, &let_value);
-                        }
+                        resolved_replacements.insert(self.var_name(index), let_value.clone());
                     }
                 }
-            }
-        }
-
-        self.value_pool = lets.clone();
-
-        for (index, let_) in lets.iter().enumerate() {
-            if matches!(self.value_counter.get(&index), Some(c) if *c > 1) {
-                continue;
-            }
-
-            if let MLIR::MakeFunction { name, params, body } = let_ {
-                self.value_to_drop.push(index);
-
-                optimized = replace_every_function_call_in(optimized, name, body, &params);
-
                 self.value_counter.remove(&index);
-
-                continue;
+                lets[index] = resolved_let;
+            } else {
+                lets[index] = resolved_let;
             }
-
-            self.value_to_drop.push(index);
-            let var_str = self.var_name(index);
-            // let_ est une reference : pas de clone sauf si une substitution a lieu
-            optimized = replace_variable_with_value(&optimized, var_str, let_);
-            self.value_counter.remove(&index);
         }
 
-        optimized
+        for _ in 0..5 {
+            let mut updated = HashMap::new();
+            for (name, (body, params)) in resolved_functions.iter() {
+                let resolved_body =
+                    replace_multiple_every_function_call_in(body.clone(), &resolved_functions);
+                updated.insert(*name, (resolved_body, params.clone()));
+            }
+            resolved_functions = updated;
+        }
+
+        for val in lets.iter_mut() {
+            let old = std::mem::replace(val, MLIR::Null);
+            *val = replace_multiple_every_function_call_in(old, &resolved_functions);
+        }
+
+        self.value_pool = lets;
+
+        for mlir in formatted_mlir.iter_mut() {
+            let old = std::mem::replace(mlir, MLIR::Null);
+            let val = replace_multiple_variables_with_values(old, &resolved_replacements);
+            *mlir = replace_multiple_every_function_call_in(val, &resolved_functions);
+        }
+
+        formatted_mlir
     }
 
     pub fn remove_unused_variables(&mut self, mlirs: Vec<MLIR<'a>>) -> Vec<MLIR<'a>> {
@@ -154,27 +166,29 @@ impl<'a> ValueOptimizer<'a> {
     pub fn optimize(&mut self, mlir: &MLIR<'a>, root: bool) -> MLIR<'a> {
         match mlir {
             MLIR::String(_) | MLIR::Bool(_) | MLIR::Number(_) if !root => {
-                if let Some(index) = self.value_pool.iter().position(|v| *v == *mlir) {
+                if let Some(&index) = self.value_indices.get(mlir) {
                     *self.value_counter.entry(index).or_insert(0) += 1;
                     self.create_variable(index)
                 } else {
                     let index = self.value_pool.len();
                     self.value_pool.push(mlir.clone());
+                    self.value_indices.insert(mlir.clone(), index);
                     self.value_counter.insert(index, 1);
                     self.create_variable(index)
                 }
             }
 
             MLIR::Array(elements) if !root => {
-                if let Some(index) = self.value_pool.iter().position(|v| *mlir == *v) {
+                let unique_elements = elements.iter().map(|e| self.optimize(e, false)).collect();
+                let array_mlir = MLIR::Array(unique_elements);
+                if let Some(&index) = self.value_indices.get(&array_mlir) {
                     *self.value_counter.entry(index).or_insert(0) += 1;
                     self.create_variable(index)
                 } else {
-                    let unique_elements =
-                        elements.iter().map(|e| self.optimize(e, false)).collect();
                     let index = self.value_pool.len();
-                    self.value_pool.push(MLIR::Array(unique_elements));
                     self.value_counter.insert(index, 1);
+                    self.value_indices.insert(array_mlir.clone(), index);
+                    self.value_pool.push(array_mlir);
                     self.create_variable(index)
                 }
             }
@@ -194,11 +208,12 @@ impl<'a> ValueOptimizer<'a> {
                     params: params.clone(),
                     body: optimized_body,
                 };
-                if let Some(index) = self.value_pool.iter().position(|v| *v == function) {
+                if let Some(&index) = self.value_indices.get(&function) {
                     *self.value_counter.entry(index).or_insert(0) += 1;
                 } else {
                     let index = self.value_pool.len();
                     self.value_counter.insert(index, 1);
+                    self.value_indices.insert(function.clone(), index);
                     self.value_pool.push(function);
                 }
                 MLIR::Variable(*name)
@@ -231,14 +246,88 @@ impl<'a> ValueOptimizer<'a> {
                 MLIR::Object(optimized_obj)
             }
 
+            MLIR::Array(elements) => {
+                let optimized_elements = elements.iter().map(|e| self.optimize(e, false)).collect();
+                MLIR::Array(optimized_elements)
+            }
+
             _ => mlir.clone(),
         }
     }
 }
 
-/// Remplace recursivement chaque appel a `name(args)` par le corps inline.
-/// `new_value` et `new_params` sont passes par reference : on ne clone
-/// `new_value` qu'au moment d'une substitution effective.
+pub fn replace_multiple_every_function_call_in<'a>(
+    mlir: MLIR<'a>,
+    functions: &HashMap<&'a str, (MLIR<'a>, Vec<&'a str>)>,
+) -> MLIR<'a> {
+    match mlir {
+        MLIR::FunctionCall {
+            name: func_name,
+            args,
+        } => {
+            if functions.contains_key(func_name) {
+                let (new_value, new_params) = &functions[func_name];
+                let bound: HashMap<&'a str, MLIR<'a>> = new_params
+                    .iter()
+                    .zip(args.iter())
+                    .map(|(p, a)| (*p, a.clone()))
+                    .collect();
+                let result = replace_multiple_variables_with_values(new_value.clone(), &bound);
+                replace_multiple_every_function_call_in(result, functions)
+            } else {
+                MLIR::FunctionCall {
+                    name: func_name,
+                    args: args
+                        .into_iter()
+                        .map(|e| replace_multiple_every_function_call_in(e, functions))
+                        .collect(),
+                }
+            }
+        }
+
+        MLIR::Add { left, right } => MLIR::Add {
+            left: Box::new(replace_multiple_every_function_call_in(*left, functions)),
+            right: Box::new(replace_multiple_every_function_call_in(*right, functions)),
+        },
+
+        MLIR::Array(elements) => MLIR::Array(
+            elements
+                .into_iter()
+                .map(|e| replace_multiple_every_function_call_in(e, functions))
+                .collect(),
+        ),
+
+        MLIR::Object(hm) => MLIR::Object(
+            hm.into_iter()
+                .map(|(k, v)| (k, replace_multiple_every_function_call_in(v, functions)))
+                .collect(),
+        ),
+
+        MLIR::MakeFunction {
+            name: fn_name,
+            params: fn_params,
+            body: fn_body,
+        } => MLIR::MakeFunction {
+            name: fn_name,
+            params: fn_params,
+            body: Box::new(replace_multiple_every_function_call_in(*fn_body, functions)),
+        },
+
+        MLIR::Let {
+            name: let_name,
+            value: let_value,
+        } => MLIR::Let {
+            name: let_name,
+            value: Box::new(replace_multiple_every_function_call_in(
+                *let_value, functions,
+            )),
+        },
+
+        _ => mlir,
+    }
+}
+
+/// Replace recursively each call to `name(args)` by the inlined body.
 pub fn replace_every_function_call_in<'a>(
     mlir: MLIR<'a>,
     name: &'a str,
@@ -250,7 +339,6 @@ pub fn replace_every_function_call_in<'a>(
             name: func_name,
             ref args,
         } if func_name == name => {
-            // Associe chaque parametre formel a son argument (recursivement substitue)
             let bound: Vec<(&'a str, MLIR<'a>)> = new_params
                 .iter()
                 .copied()
@@ -259,12 +347,9 @@ pub fn replace_every_function_call_in<'a>(
                 }))
                 .collect();
 
-            // Substitue les parametres dans une copie fraiche de new_value
             let result = bound.iter().fold(new_value.clone(), |acc, (k, v)| {
                 replace_variable_with_value(&acc, k, v)
             });
-
-            // Recurse au cas ou le resultat contient encore des appels a `name`
             replace_every_function_call_in(result, name, new_value, new_params)
         }
 

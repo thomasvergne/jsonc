@@ -134,6 +134,17 @@ impl Decoder {
                     idx += str_len;
                     quantity += 1;
                 }
+                0x02 => {
+                    // float literal: 8 bytes raw
+                    if idx + 8 > bits.len() {
+                        return Err(DecoderError::InvalidLiteral("unexpected end of input".to_string()));
+                    }
+                    let mut bytes = [0u8; 8];
+                    bytes.copy_from_slice(&bits[idx..idx + 8]);
+                    idx += 8;
+                    value_pool.push(Literal::Float(u64::from_le_bytes(bytes)));
+                    quantity += 1;
+                }
 
                 // Not a literal type -> error
                 other => {
@@ -265,6 +276,13 @@ impl Decoder {
                     }
                 }
                 0x0E => OpCode::Nop,
+                0x0F => {
+                    let (val_idx_u, c) = self.decode_uleb128(&bits, idx)?;
+                    idx += c;
+                    OpCode::MakeFloat {
+                        value: val_idx_u as Address,
+                    }
+                }
                 _ => return Err(DecoderError::InvalidOpcode(OpCode::Nop)),
             };
 
@@ -279,6 +297,19 @@ impl Decoder {
     ///
     /// The returned MLIR nodes borrow from the decoder's own value pool where needed.
     pub fn to_mlir<'a>(&'a self) -> Result<Vec<MLIR<'a>>, DecoderError> {
+        fn cached_symbol<'a>(
+            cache: &mut HashMap<usize, &'a str>,
+            prefix: &str,
+            index: usize,
+        ) -> &'a str {
+            if let Some(name) = cache.get(&index) {
+                return name;
+            }
+            let name: &'a str = Box::leak(format!("{}{}", prefix, index).into_boxed_str());
+            cache.insert(index, name);
+            name
+        }
+
         // Helper that executes a range of instructions and returns the stack after executing
         fn exec_range<'a>(
             decoder: &'a Decoder,
@@ -286,6 +317,9 @@ impl Decoder {
             start: usize,
             count: usize,
             globals: &mut Vec<MLIR<'a>>,
+            global_name_cache: &mut HashMap<usize, &'a str>,
+            local_name_cache: &mut HashMap<usize, &'a str>,
+            function_name_cache: &mut HashMap<usize, &'a str>,
         ) -> Result<(Vec<MLIR<'a>>, usize), DecoderError> {
             use jsonc_bytecode::OpCode::*;
             use jsonc_mlir::MLIR;
@@ -315,11 +349,20 @@ impl Decoder {
                         }
                     },
 
+                    MakeFloat { value: idx } => match decoder.value_pool.get(idx as usize) {
+                        Some(jsonc_bytecode::Literal::Float(v)) => {
+                            stack.push(MLIR::Number(f64::from_bits(*v)));
+                        }
+                        _ => {
+                            return Err(DecoderError::InvalidLiteral(
+                                "MakeFloat: literal is not a float".to_string(),
+                            ));
+                        }
+                    },
+
                     MakeString { value: idx } => match decoder.value_pool.get(idx as usize) {
                         Some(jsonc_bytecode::Literal::String(s)) => {
-                            // create a &'a str that borrows from the decoder's pool
-                            let s_ref: &'a str = Box::leak(s.clone().into_boxed_str());
-                            stack.push(MLIR::String(s_ref));
+                            stack.push(MLIR::String(s.as_str()));
                         }
                         _ => {
                             return Err(DecoderError::InvalidLiteral(
@@ -366,8 +409,7 @@ impl Decoder {
                         let value = stack.pop().unwrap();
                         match decoder.value_pool.get(key_idx as usize) {
                             Some(jsonc_bytecode::Literal::String(k)) => {
-                                let k_ref: &'a str = Box::leak(k.clone().into_boxed_str());
-                                stack.push(MLIR::Object(vec![(k_ref, value)]));
+                                stack.push(MLIR::Object(vec![(k.as_str(), value)]));
                             }
                             _ => {
                                 return Err(DecoderError::InvalidLiteral(
@@ -428,7 +470,7 @@ impl Decoder {
                         globals[idx] = value.clone();
 
                         // create a let binding name v{idx}
-                        let name = Box::leak(format!("g{}", idx).into_boxed_str());
+                        let name = cached_symbol(global_name_cache, "g", idx);
                         let let_node = MLIR::Let {
                             name,
                             value: Box::new(value),
@@ -443,7 +485,7 @@ impl Decoder {
                             "StoreLocal at instr {}: stack is too small",
                             i - 1
                         )))?;
-                        let name = Box::leak(format!("l{}", idx).into_boxed_str());
+                        let name = cached_symbol(local_name_cache, "l", idx);
                         let let_node = MLIR::Let {
                             name,
                             value: Box::new(value),
@@ -453,13 +495,13 @@ impl Decoder {
 
                     LoadGlobal { var_index: idx } => {
                         let idx = idx as usize;
-                        let name = Box::leak(format!("g{}", idx).into_boxed_str());
+                        let name = cached_symbol(global_name_cache, "g", idx);
                         stack.push(MLIR::Variable(name));
                     }
 
                     LoadLocal { var_index: idx } => {
                         let idx = idx as usize;
-                        let name = Box::leak(format!("l{}", idx).into_boxed_str());
+                        let name = cached_symbol(local_name_cache, "l", idx);
                         stack.push(MLIR::Variable(name));
                     }
 
@@ -469,8 +511,16 @@ impl Decoder {
                     } => {
                         let func_addr = i;
                         // execute body instructions in a nested fresh execution to obtain body MLIR nodes
-                        let (body_stack, consumed) =
-                            exec_range(decoder, instrs, i, body_len as usize, globals)?;
+                        let (body_stack, consumed) = exec_range(
+                            decoder,
+                            instrs,
+                            i,
+                            body_len as usize,
+                            globals,
+                            global_name_cache,
+                            local_name_cache,
+                            function_name_cache,
+                        )?;
                         // advance i and processed by body_len
                         i += consumed;
                         processed += consumed;
@@ -478,11 +528,11 @@ impl Decoder {
                         // create placeholder param names
                         let mut params: Vec<&'a str> = Vec::new();
                         for p in 0..params_len as usize {
-                            let name = Box::leak(format!("l{}", p).into_boxed_str());
+                            let name = cached_symbol(local_name_cache, "l", p);
                             params.push(name);
                         }
 
-                        let func_name = Box::leak(format!("f{}", i).into_boxed_str());
+                        let func_name = cached_symbol(function_name_cache, "f", func_addr);
 
                         let body = match body_stack.as_slice() {
                             [] => Box::new(MLIR::Null),
@@ -509,10 +559,25 @@ impl Decoder {
                         num_args: args_len,
                         func_index: func_addr,
                     } => {
+                        if stack.len() < args_len as usize {
+                            return Err(DecoderError::InvalidLiteral(format!(
+                                "CallFunction at instr {}: stack is too small",
+                                i - 1
+                            )));
+                        }
                         let args = stack.split_off(stack.len() - args_len as usize);
-                        let func = stack.pop().unwrap_or_else(|| {
-                            functions.get(&(func_addr as usize)).unwrap().clone()
-                        });
+                        let func = match stack.pop() {
+                            Some(func) => func,
+                            None => {
+                                functions.get(&(func_addr as usize)).cloned().ok_or(
+                                    DecoderError::InvalidLiteral(format!(
+                                        "CallFunction at instr {}: unknown function index {}",
+                                        i - 1,
+                                        func_addr
+                                    )),
+                                )?
+                            }
+                        };
 
                         let func_name = match func {
                             MLIR::MakeFunction { name, .. } => name,
@@ -533,7 +598,20 @@ impl Decoder {
 
         // Execute the whole bytecode
         let mut globals: Vec<MLIR<'a>> = Vec::with_capacity(u8::MAX as usize);
-        let (stack, _) = exec_range(self, &self.bytecode, 0, self.bytecode.len(), &mut globals)?;
+        let mut global_name_cache: HashMap<usize, &'a str> = HashMap::new();
+        let mut local_name_cache: HashMap<usize, &'a str> = HashMap::new();
+        let mut function_name_cache: HashMap<usize, &'a str> = HashMap::new();
+
+        let (stack, _) = exec_range(
+            self,
+            &self.bytecode,
+            0,
+            self.bytecode.len(),
+            &mut globals,
+            &mut global_name_cache,
+            &mut local_name_cache,
+            &mut function_name_cache,
+        )?;
 
         let mut mlir = Vec::new();
         mlir.extend(globals);

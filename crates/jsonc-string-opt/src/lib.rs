@@ -1,14 +1,18 @@
+use std::collections::{HashMap, HashSet};
+
 use aho_corasick::{AhoCorasick, MatchKind};
 use jsonc_mlir::MLIR;
 
 pub struct StringOptimizer<'a> {
     pub strings: Vec<&'a str>,
+    string_counts: HashMap<&'a str, usize>,
 }
 
 impl<'a> StringOptimizer<'a> {
     pub fn new() -> Self {
         Self {
             strings: Vec::new(),
+            string_counts: HashMap::new(),
         }
     }
 
@@ -32,6 +36,7 @@ impl<'a> StringOptimizer<'a> {
 
     fn add_string(&mut self, s: &'a str) {
         self.strings.push(s);
+        *self.string_counts.entry(s).or_insert(0) += 1;
     }
 
     pub fn traverse_and_collect_strings(&mut self, mlir: &MLIR<'a>) {
@@ -55,37 +60,40 @@ impl<'a> StringOptimizer<'a> {
         self.strings.iter().copied().filter(|&x| x != s).collect()
     }
 
-    /// Décompose `s` en sous-chaînes issues des candidats via Aho-Corasick.
-    ///
-    /// Complexité : O(N + M) par chaîne (N = len(s), M = total len des candidats)
-    /// au lieu de O(C × N) avec la boucle précédente.
-    /// Les espaces entre les correspondances sont retournés comme littéraux.
-    fn substrings_ac<'b>(s: &'a str, ac: &AhoCorasick, candidates: &'b [&'a str]) -> Vec<&'a str> {
+    /// Decompose `s` into substrings from candidates using Aho-Corasick.
+    fn substrings_ac<'b>(
+        s: &'a str,
+        ac: &AhoCorasick,
+        candidates: &'b [&'a str],
+    ) -> Option<Vec<&'a str>> {
         if s.is_empty() {
-            return Vec::new();
+            return None;
         }
 
         let mut result: Vec<&'a str> = Vec::new();
         let mut last_end: usize = 0;
+        let mut has_match = false;
 
         for mat in ac.find_iter(s) {
-            // Littéral avant la correspondance (ne contient aucun candidat)
+            has_match = true;
             let gap = &s[last_end..mat.start()];
             if !gap.is_empty() {
                 result.push(gap);
             }
-            // Candidat correspondant
             result.push(candidates[mat.pattern().as_usize()]);
             last_end = mat.end();
         }
 
-        // Queue après la dernière correspondance
         let tail = &s[last_end..];
         if !tail.is_empty() {
             result.push(tail);
         }
 
-        if result.is_empty() { vec![s] } else { result }
+        if !has_match || (result.len() == 1 && result[0] == s) {
+            None
+        } else {
+            Some(result)
+        }
     }
 
     fn optimize_with_ac(
@@ -93,25 +101,42 @@ impl<'a> StringOptimizer<'a> {
         mlir: &MLIR<'a>,
         ac: &AhoCorasick,
         candidates: &[&'a str],
+        candidates_set: &HashSet<&'a str>,
+        min_candidate_len: usize,
     ) -> MLIR<'a> {
         match mlir {
             MLIR::String(s) if !s.is_empty() => {
-                let parts = Self::substrings_ac(s, ac, candidates);
-                // Si la seule partie est la chaîne elle-même, rien à optimiser
-                if parts.len() == 1 && parts[0] == *s {
+                if s.len() < min_candidate_len {
                     MLIR::String(s)
-                } else {
+                } else if candidates_set.contains(s) {
+                    MLIR::String(s)
+                } else if let Some(parts) = Self::substrings_ac(s, ac, candidates) {
                     self.build_string_expr(parts)
+                } else {
+                    MLIR::String(s)
                 }
             }
             MLIR::Array(arr) => MLIR::Array(
                 arr.iter()
-                    .map(|e| self.optimize_with_ac(e, ac, candidates))
+                    .map(|e| {
+                        self.optimize_with_ac(e, ac, candidates, candidates_set, min_candidate_len)
+                    })
                     .collect(),
             ),
             MLIR::Object(obj) => MLIR::Object(
                 obj.iter()
-                    .map(|(k, v)| (*k, self.optimize_with_ac(v, ac, candidates)))
+                    .map(|(k, v)| {
+                        (
+                            *k,
+                            self.optimize_with_ac(
+                                v,
+                                ac,
+                                candidates,
+                                candidates_set,
+                                min_candidate_len,
+                            ),
+                        )
+                    })
                     .collect(),
             ),
             _ => mlir.clone(),
@@ -119,27 +144,35 @@ impl<'a> StringOptimizer<'a> {
     }
 
     pub fn optimize(&mut self, mlir: &MLIR<'a>) -> MLIR<'a> {
-        // Candidats triés du plus long au plus court, dédupliqués
-        // (plus long en premier = correspondances plus greedy, meilleure compression)
+        const MIN_CANDIDATE_OCCURRENCES: usize = 2;
+        const MIN_CANDIDATE_LEN: usize = 3;
+
         let mut candidates: Vec<&'a str> = self
-            .strings
+            .string_counts
             .iter()
-            .copied()
-            .filter(|s| !s.is_empty())
+            .filter_map(|(s, count)| {
+                if !s.is_empty()
+                    && *count >= MIN_CANDIDATE_OCCURRENCES
+                    && s.len() >= MIN_CANDIDATE_LEN
+                {
+                    Some(*s)
+                } else {
+                    None
+                }
+            })
             .collect();
         candidates.sort_unstable_by(|a, b| b.len().cmp(&a.len()));
-        candidates.dedup();
 
         if candidates.is_empty() {
             return mlir.clone();
         }
+        let candidates_set: HashSet<&'a str> = candidates.iter().copied().collect();
 
-        // Automate construit une seule fois pour tout l'arbre MLIR
         let ac = AhoCorasick::builder()
             .match_kind(MatchKind::LeftmostLongest)
             .build(&candidates)
-            .expect("Aho-Corasick: construction echouee");
+            .expect("Aho-Corasick: construction failed");
 
-        self.optimize_with_ac(mlir, &ac, &candidates)
+        self.optimize_with_ac(mlir, &ac, &candidates, &candidates_set, MIN_CANDIDATE_LEN)
     }
 }

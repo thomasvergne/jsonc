@@ -8,61 +8,71 @@ pub struct ObjectOptimizer<'a> {
     pub new_functions: HashMap<&'a str, MLIR<'a>>,
 }
 
-pub fn replace_every<'a>(mlir: MLIR<'a>, value: &(&'a str, MLIR<'a>)) -> MLIR<'a> {
+pub fn replace_multiple_variables_with_values<'a>(
+    mlir: MLIR<'a>,
+    replacements: &HashMap<&'a str, MLIR<'a>>,
+) -> MLIR<'a> {
     match mlir {
-        mlir if &mlir == &value.1 => MLIR::Variable(value.0),
+        MLIR::Variable(n) => {
+            if let Some(val) = replacements.get(n) {
+                val.clone()
+            } else {
+                MLIR::Variable(n)
+            }
+        }
 
         MLIR::Object(hm) => MLIR::Object(
             hm.into_iter()
-                .map(|(k, v)| (k, replace_every(v, value)))
+                .map(|(k, v)| (k, replace_multiple_variables_with_values(v, replacements)))
                 .collect(),
         ),
 
         MLIR::Array(elements) => MLIR::Array(
             elements
                 .into_iter()
-                .map(|v| replace_every(v, value))
+                .map(|v| replace_multiple_variables_with_values(v, replacements))
                 .collect(),
         ),
 
         MLIR::Add { left, right } => MLIR::Add {
-            left: Box::new(replace_every(*left, value)),
-            right: Box::new(replace_every(*right, value)),
+            left: Box::new(replace_multiple_variables_with_values(*left, replacements)),
+            right: Box::new(replace_multiple_variables_with_values(*right, replacements)),
         },
 
-        MLIR::FunctionCall { name, args } => MLIR::FunctionCall {
-            name,
-            args: args.into_iter().map(|v| replace_every(v, value)).collect(),
+        MLIR::FunctionCall {
+            name: fn_name,
+            args,
+        } => MLIR::FunctionCall {
+            name: fn_name,
+            args: args
+                .into_iter()
+                .map(|v| replace_multiple_variables_with_values(v, replacements))
+                .collect(),
         },
 
-        MLIR::MakeFunction { name, params, body } => MLIR::MakeFunction {
-            name,
+        MLIR::MakeFunction {
+            name: fn_name,
             params,
-            body: Box::new(replace_every(*body, value)),
+            body,
+        } => MLIR::MakeFunction {
+            name: fn_name,
+            params,
+            body: Box::new(replace_multiple_variables_with_values(*body, replacements)),
         },
 
         MLIR::Let {
-            name,
-            value: new_value,
+            name: let_name,
+            value,
         } => MLIR::Let {
-            name,
-            value: Box::new(replace_every(*new_value, value)),
+            name: let_name,
+            value: Box::new(replace_multiple_variables_with_values(*value, replacements)),
         },
 
         _ => mlir,
     }
 }
 
-pub fn replace_every_multiple<'a>(mlir: MLIR<'a>, values: &[(&'a str, MLIR<'a>)]) -> MLIR<'a> {
-    values
-        .iter()
-        .fold(mlir, |acc, value| replace_every(acc, value))
-}
-
-/// Remplace chaque nœud `Variable(name)` par `val`.
-///
-/// `val` est passé par référence : le clone n'a lieu qu'au moment de la
-/// substitution effective, évitant O(pool_size) clones par site d'appel.
+/// Replace every node `Variable(name)` by `val`.
 pub fn replace_variable_with_value<'a>(mlir: &MLIR<'a>, name: &'a str, val: &MLIR<'a>) -> MLIR<'a> {
     match mlir {
         MLIR::Variable(n) if *n == name => val.clone(),
@@ -154,7 +164,6 @@ impl<'a> ObjectOptimizer<'a> {
         match mlir {
             MLIR::Object(hm) => {
                 let keys: Vec<&str> = hm.iter().map(|(k, _)| *k).collect();
-                // Consomme la String directement, sans clone intermédiaire
                 let function_str: &'static str = Box::leak(keys.join("_").into_boxed_str());
 
                 let pairs: Vec<(&str, MLIR<'a>)> = hm
@@ -162,44 +171,30 @@ impl<'a> ObjectOptimizer<'a> {
                     .map(|(k, v)| (k, self.optimize(v, false)))
                     .collect();
 
-                let result = MLIR::Object(pairs.clone());
-
-                if !root && self.new_functions.get(function_str).is_none() {
-                    self.add_json(result.clone());
-                    let body = Box::new(replace_every_multiple(result.clone(), &pairs));
+                if !root && !self.new_functions.contains_key(function_str) {
+                    self.add_json(MLIR::Object(pairs.clone()));
+                    let body = Box::new(MLIR::Object(
+                        keys.iter().map(|&k| (k, MLIR::Variable(k))).collect(),
+                    ));
                     self.new_functions.insert(
                         function_str,
                         MLIR::MakeFunction {
                             name: function_str,
                             params: keys.clone(),
-                            body, // move au lieu de clone
+                            body,
                         },
                     );
                 }
 
                 if !root {
-                    if let Some(existing) = self.new_functions.get(function_str) {
-                        let optimized_existing = self.optimize(existing.clone(), false);
-                        self.new_functions
-                            .insert(function_str, optimized_existing.clone());
-
-                        return MLIR::FunctionCall {
-                            name: function_str,
-                            args: keys
-                                .iter()
-                                .map(|k| {
-                                    pairs
-                                        .iter()
-                                        .find(|(k_, _)| k == k_)
-                                        .map(|(_, v)| v.clone())
-                                        .unwrap_or(MLIR::Null)
-                                })
-                                .collect(),
-                        };
-                    }
+                    let args = pairs.into_iter().map(|(_, v)| v).collect();
+                    return MLIR::FunctionCall {
+                        name: function_str,
+                        args,
+                    };
                 }
 
-                result
+                MLIR::Object(pairs)
             }
 
             MLIR::Array(vec) => {

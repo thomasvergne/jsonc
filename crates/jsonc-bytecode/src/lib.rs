@@ -1,6 +1,6 @@
-use std::{fmt::Debug};
+use std::fmt::Debug;
 
-pub type Address = u16;
+pub type Address = u32;
 
 #[derive(Clone, Copy)]
 pub enum OpCode {
@@ -19,11 +19,13 @@ pub enum OpCode {
     LoadGlobal { var_index: Address },
     LoadLocal { var_index: Address },
     Nop,
+    MakeFloat { value: Address },
 }
 
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug, Hash)]
 pub enum Literal {
     Integer(i64),
+    Float(u64),
     String(String),
 }
 
@@ -45,6 +47,7 @@ impl OpCode {
             OpCode::LoadGlobal { .. } => 12,
             OpCode::LoadLocal { .. } => 13,
             OpCode::Nop => 14,
+            OpCode::MakeFloat { .. } => 15,
         }
     }
 }
@@ -66,6 +69,7 @@ impl Debug for OpCode {
                 write!(f, "make_array num_elements={}", num_elements)
             }
             OpCode::MakeInteger { value } => write!(f, "make_integer value={}", value),
+            OpCode::MakeFloat { value } => write!(f, "make_float value={}", value),
             OpCode::MakeString { value } => write!(f, "make_string value={}", value),
             OpCode::MakeNull => write!(f, "make_null"),
             OpCode::MakeBoolean { value } => write!(f, "make_boolean value={}", value),

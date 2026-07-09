@@ -2,6 +2,14 @@ use std::{collections::HashMap, fmt::Debug};
 
 use serde_json::json;
 
+#[macro_export]
+macro_rules! debug {
+    ($($arg:tt)*) => {
+        #[cfg(debug_assertions)]
+        println!($($arg)*);
+    };
+}
+
 #[derive(Clone, PartialEq)]
 pub enum MLIR<'a> {
     String(&'a str),
@@ -130,7 +138,16 @@ pub fn to_json<'a>(mlir: &MLIR<'a>, env: &mut HashMap<&'a str, MLIR<'a>>) -> ser
             serde_json::Value::Object(map)
         }
         MLIR::Null => serde_json::Value::Null,
-        MLIR::Number(n) => json!(*n),
+        MLIR::Number(n) => {
+            if n.fract() == 0.0 && *n >= (i64::MIN as f64) && *n <= (i64::MAX as f64) {
+                serde_json::Value::Number(serde_json::Number::from(*n as i64))
+            } else {
+                match serde_json::Number::from_f64(*n) {
+                    Some(num) => serde_json::Value::Number(num),
+                    None => serde_json::Value::Null,
+                }
+            }
+        }
         MLIR::Bool(b) => serde_json::Value::Bool(*b),
         MLIR::Variable(name) => {
             // Clone uniquement la valeur trouvee, pas tout l'env
@@ -192,4 +209,61 @@ pub fn multiple_to_json<'a>(
     }
 
     result
+}
+
+impl<'a> Eq for MLIR<'a> {}
+
+impl<'a> std::hash::Hash for MLIR<'a> {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        match self {
+            MLIR::String(s) => {
+                0u8.hash(state);
+                s.hash(state);
+            }
+            MLIR::Array(arr) => {
+                1u8.hash(state);
+                arr.hash(state);
+            }
+            MLIR::Object(obj) => {
+                2u8.hash(state);
+                obj.hash(state);
+            }
+            MLIR::Null => {
+                3u8.hash(state);
+            }
+            MLIR::Number(n) => {
+                4u8.hash(state);
+                n.to_bits().hash(state);
+            }
+            MLIR::Bool(b) => {
+                5u8.hash(state);
+                b.hash(state);
+            }
+            MLIR::Variable(s) => {
+                6u8.hash(state);
+                s.hash(state);
+            }
+            MLIR::FunctionCall { name, args } => {
+                7u8.hash(state);
+                name.hash(state);
+                args.hash(state);
+            }
+            MLIR::MakeFunction { name, params, body } => {
+                8u8.hash(state);
+                name.hash(state);
+                params.hash(state);
+                body.hash(state);
+            }
+            MLIR::Let { name, value } => {
+                9u8.hash(state);
+                name.hash(state);
+                value.hash(state);
+            }
+            MLIR::Add { left, right } => {
+                10u8.hash(state);
+                left.hash(state);
+                right.hash(state);
+            }
+        }
+    }
 }
