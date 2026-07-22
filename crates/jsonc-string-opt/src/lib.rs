@@ -3,6 +3,9 @@ use std::collections::{HashMap, HashSet};
 use aho_corasick::{AhoCorasick, MatchKind};
 use jsonc_mlir::MLIR;
 
+/// String optimization structure definition
+/// This stores the collected strings during the first phase of analysis and also
+/// stores the strings occurrences during the second phase of analysis.
 pub struct StringOptimizer<'a> {
     pub strings: Vec<&'a str>,
     string_counts: HashMap<&'a str, usize>,
@@ -16,6 +19,14 @@ impl<'a> StringOptimizer<'a> {
         }
     }
 
+    /// Build a string expression from the given strings, formally:
+    ///
+    /// ```
+    /// StringExpr = String | StringExpr + String
+    /// ```
+    ///
+    /// Returns a [`MLIR::String`] if the vector is empty, a single string if the
+    /// vector has a single element, or a [`MLIR::Add`] expression otherwise.
     pub fn build_string_expr(&self, strings: Vec<&'a str>) -> MLIR<'a> {
         let filtered: Vec<&'a str> = strings.into_iter().filter(|s| !s.is_empty()).collect();
 
@@ -34,11 +45,13 @@ impl<'a> StringOptimizer<'a> {
             })
     }
 
+    /// Adds a string to the string pool and increments its count in the string counts map.
     fn add_string(&mut self, s: &'a str) {
         self.strings.push(s);
         *self.string_counts.entry(s).or_insert(0) += 1;
     }
 
+    /// Traverses the MLIR tree and collects all strings into the string pool.
     pub fn traverse_and_collect_strings(&mut self, mlir: &MLIR<'a>) {
         match mlir {
             MLIR::String(s) => self.add_string(s),
@@ -56,11 +69,15 @@ impl<'a> StringOptimizer<'a> {
         }
     }
 
+    /// Removes all occurrences of `s` from the string pool and returns the remaining strings.
     pub fn remove_string(&self, s: &str) -> Vec<&'a str> {
         self.strings.iter().copied().filter(|&x| x != s).collect()
     }
 
     /// Decompose `s` into substrings from candidates using Aho-Corasick.
+    /// Used to decompose a string into a sequence of substrings from the string pool,
+    /// and to be later optimized into a [`MLIR::String`] or [`MLIR::Add`] expression
+    /// using [`StringOptimizer::optimize_with_ac`].
     fn substrings_ac<'b>(
         s: &'a str,
         ac: &AhoCorasick,
@@ -96,6 +113,9 @@ impl<'a> StringOptimizer<'a> {
         }
     }
 
+    /// Main optimization function that uses Aho-Corasick to decompose a string
+    /// into a sequence of substrings from the string pool, and then builds
+    /// a [`MLIR::String`] or [`MLIR::Add`] expression from the parts.
     fn optimize_with_ac(
         &self,
         mlir: &MLIR<'a>,
@@ -143,9 +163,17 @@ impl<'a> StringOptimizer<'a> {
         }
     }
 
+    /// Main optimization function that uses Aho-Corasick to decompose a string
+    /// into a sequence of substrings from the string pool, and then builds
+    /// a [`MLIR::String`] or [`MLIR::Add`] expression from the parts.
+    ///
+    /// This function defines the prerequisites for string optimization:
+    /// - The string must be non-empty
+    /// - The string must occur at least `MIN_CANDIDATE_OCCURRENCES` times
+    /// - The string must be at least `MIN_CANDIDATE_LEN` characters long
     pub fn optimize(&mut self, mlir: &MLIR<'a>) -> MLIR<'a> {
         const MIN_CANDIDATE_OCCURRENCES: usize = 2;
-        const MIN_CANDIDATE_LEN: usize = 3;
+        const MIN_CANDIDATE_LEN: usize = 128;
 
         let mut candidates: Vec<&'a str> = self
             .string_counts
