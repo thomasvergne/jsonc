@@ -34,6 +34,12 @@ Encode any JSON file
   ./target/release/jsonc encode my-file.json
 ```
 
+And decode any JSONB file
+
+```bash
+  ./target/release/jsonc decode my-file.jsonb
+```
+
 ## Authors
 
 - [@thomasvergne](https://www.github.com/thomasvergne)
