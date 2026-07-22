@@ -1,6 +1,6 @@
 use std::{collections::HashMap, fmt::Debug};
 
-use serde_json::json;
+use serde_json::{Map, json};
 
 #[macro_export]
 macro_rules! debug {
@@ -105,6 +105,7 @@ impl<'a> Debug for MLIR<'a> {
     }
 }
 
+/// Converting a JSON value to MLIR.
 pub fn from_json<'a>(value: &'a serde_json::Value) -> MLIR<'a> {
     match value {
         serde_json::Value::String(s) => MLIR::String(s),
@@ -125,55 +126,118 @@ pub fn from_json<'a>(value: &'a serde_json::Value) -> MLIR<'a> {
     }
 }
 
-// Use owned MLIR values in the environment to avoid returning references to temporaries
-pub fn to_json<'a>(mlir: &MLIR<'a>, env: &mut HashMap<&'a str, MLIR<'a>>) -> serde_json::Value {
-    match mlir {
-        MLIR::String(s) => serde_json::Value::String(s.to_string()),
-        MLIR::Array(arr) => serde_json::Value::Array(arr.iter().map(|v| to_json(v, env)).collect()),
-        MLIR::Object(obj) => {
-            let mut map = serde_json::Map::new();
-            for (k, v) in obj {
-                map.insert(k.to_string(), to_json(v, env));
+/// Environment for resolving MLIR variable references.
+///
+/// This enum represents the environment in which MLIR variable references are resolved.
+/// It supports nested environments for scoping.
+#[derive(Debug)]
+pub enum Env<'a, 'b> {
+    Root(&'b mut HashMap<&'a str, MLIR<'a>>),
+    Nested {
+        parent: &'b Env<'a, 'b>,
+        bindings: HashMap<&'a str, MLIR<'a>>,
+    },
+}
+
+impl<'a, 'b> Env<'a, 'b> {
+    /// Returns the value of the given variable name, if it exists in this environment or its parent.
+    pub fn get(&self, name: &str) -> Option<&MLIR<'a>> {
+        match self {
+            Env::Root(map) => map.get(name),
+            Env::Nested { parent, bindings } => {
+                if name.starts_with('l') {
+                    bindings.get(name)
+                } else {
+                    bindings.get(name).or_else(|| parent.get(name))
+                }
             }
-            serde_json::Value::Object(map)
+        }
+    }
+
+    /// Inserts a new variable binding into this environment.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the environment is a nested environment.
+    pub fn insert(&mut self, name: &'a str, val: MLIR<'a>) {
+        match self {
+            Env::Root(map) => {
+                map.insert(name, val);
+            }
+            Env::Nested { .. } => {
+                panic!("Cannot insert into nested env");
+            }
+        }
+    }
+}
+
+/// Converts an MLIR node to a JSON value.
+pub fn to_json<'a, 'b>(mlir: &MLIR<'a>, env: &mut Env<'a, 'b>) -> serde_json::Value {
+    match mlir {
+        MLIR::Add { left, right } => {
+            let l_val = to_json(left, env);
+            let r_val = to_json(right, env);
+            match (l_val, r_val) {
+                (serde_json::Value::Number(l), serde_json::Value::Number(r)) => {
+                    json!(l.as_f64().unwrap_or(0.0) + r.as_f64().unwrap_or(0.0))
+                }
+                (serde_json::Value::String(l), serde_json::Value::String(r)) => {
+                    json!(l.to_string() + &r)
+                }
+                (serde_json::Value::Null, serde_json::Value::Null) => serde_json::Value::Null,
+                (serde_json::Value::Null, _) => serde_json::Value::Null,
+                (_, serde_json::Value::Null) => serde_json::Value::Null,
+                _ => serde_json::Value::Null,
+            }
+        }
+
+        MLIR::String(s) => json!(s),
+        MLIR::Array(elements) => {
+            json!(elements.iter().map(|e| to_json(e, env)).collect::<Vec<_>>())
+        }
+        MLIR::Object(obj) => {
+            let mut new_obj = Map::new();
+
+            for (k, v) in obj.iter() {
+                new_obj.insert(k.to_string(), to_json(v, env));
+            }
+
+            serde_json::Value::Object(new_obj)
         }
         MLIR::Null => serde_json::Value::Null,
-        MLIR::Number(n) => {
-            if n.fract() == 0.0 && *n >= (i64::MIN as f64) && *n <= (i64::MAX as f64) {
-                serde_json::Value::Number(serde_json::Number::from(*n as i64))
-            } else {
-                match serde_json::Number::from_f64(*n) {
-                    Some(num) => serde_json::Value::Number(num),
-                    None => serde_json::Value::Null,
-                }
-            }
-        }
-        MLIR::Bool(b) => serde_json::Value::Bool(*b),
+        MLIR::Number(n) => json!(n),
+        MLIR::Bool(b) => json!(b),
         MLIR::Variable(name) => {
-            // Clone uniquement la valeur trouvee, pas tout l'env
-            match env.get(*name).cloned() {
-                Some(val) => to_json(&val, env),
-                None => serde_json::Value::Null,
-            }
+            let value = env.get(name).unwrap().clone();
+            to_json(&value, env)
         }
-        MLIR::FunctionCall { name, args } => match env.get(*name) {
-            Some(MLIR::MakeFunction { body, params, .. }) => {
-                // clone the environment and insert parameter bindings (owned MLIRs)
-                let mut map = env.clone();
-                for (param, arg) in params.iter().zip(args.iter()) {
-                    map.insert(*param, arg.clone());
-                }
+        MLIR::FunctionCall { name, args } => {
+            let Some(function) = env.get(name) else {
+                eprintln!("function not found: {:?}", name);
+                return serde_json::Value::Null;
+            };
 
-                to_json(&body, &mut map)
+            if let MLIR::MakeFunction { params, body, .. } = function {
+                let mut new_env = HashMap::new();
+                for (k, v) in params.iter().zip(args.iter()) {
+                    new_env.insert(*k, v.clone());
+                }
+                let mut env_wrapper = Env::Nested {
+                    parent: env,
+                    bindings: new_env,
+                };
+                let result = to_json(&body, &mut env_wrapper);
+                return result;
             }
-            _ => serde_json::Value::Null,
-        },
-        MLIR::MakeFunction { params, name, body } => {
+
+            return serde_json::Value::Null;
+        }
+        MLIR::MakeFunction { name, params, body } => {
             env.insert(
                 name,
                 MLIR::MakeFunction {
+                    name,
                     params: params.clone(),
-                    name: *name,
                     body: body.clone(),
                 },
             );
@@ -182,37 +246,35 @@ pub fn to_json<'a>(mlir: &MLIR<'a>, env: &mut HashMap<&'a str, MLIR<'a>>) -> ser
         }
         MLIR::Let { name, value } => {
             env.insert(name, *value.clone());
+
             serde_json::Value::Null
         }
-        MLIR::Add { left, right } => match (to_json(left, env), to_json(right, env)) {
-            (serde_json::Value::Number(l), serde_json::Value::Number(r)) => {
-                json!(l.as_f64().unwrap_or(0.0) + r.as_f64().unwrap_or(0.0))
-            }
-            (serde_json::Value::Null, serde_json::Value::Null) => serde_json::Value::Null,
-            (serde_json::Value::Null, _) => serde_json::Value::Null,
-            (_, serde_json::Value::Null) => serde_json::Value::Null,
-            (serde_json::Value::String(s1), serde_json::Value::String(s2)) => {
-                json!(s1.to_string() + &s2)
-            }
-            _ => serde_json::Value::Null,
-        },
     }
 }
 
+/// Converts multiple MLIR nodes to a JSON value.
+///
+/// # Arguments
+///
+/// * `mlir` - The MLIR nodes to convert.
+/// * `env` - The environment for resolving variable references.
 pub fn multiple_to_json<'a>(
     mlir: &[MLIR<'a>],
     env: &mut HashMap<&'a str, MLIR<'a>>,
 ) -> serde_json::Value {
     let mut result = serde_json::Value::Null;
+    let mut env_wrapper = Env::Root(env);
     for expr in mlir {
-        result = to_json(expr, env);
+        result = to_json(expr, &mut env_wrapper);
     }
 
     result
 }
 
+/// Implements equality for MLIR nodes.
 impl<'a> Eq for MLIR<'a> {}
 
+/// Implements hashing for MLIR nodes.
 impl<'a> std::hash::Hash for MLIR<'a> {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         match self {

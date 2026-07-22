@@ -1008,7 +1008,6 @@ impl Decoder {
                     }
 
                     MakeFieldLocalBlock { fields } => {
-                        println!("MakeFieldLocalBlock {}", fields.len());
                         for (field_name, addr) in fields.iter().copied() {
                             let name = cached_symbol(local_name_cache, "l", addr as usize);
                             let field_name_lit = decoder
