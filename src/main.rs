@@ -1,10 +1,15 @@
-use std::{collections::HashMap, io::Read, path::Path};
+use std::{collections::HashMap, fmt::Display, io::Read, path::Path};
 
-use jsonc_mlir::debug;
+use ansi_term::{Colour::*, Style};
 use jsonc_object_opt::IS_ROOT;
 use serde_json::Value;
+use simd_json::serde::from_str;
 
-fn benchmark(folder: &str) {
+fn display_error<T: Display>(e: T) {
+    eprintln!("[{}] {}", Red.bold().paint("ERR"), e);
+}
+
+fn benchmark(folder: &str, compression_level: i32) {
     let files = std::fs::read_dir(folder).unwrap();
 
     let mut json_sizes = Vec::new();
@@ -18,8 +23,11 @@ fn benchmark(folder: &str) {
         }
 
         let output = file_name.with_extension("jsonb");
-        let (json_size, jsonb_size) =
-            perform_encoding(&file_name.to_str().unwrap(), output.to_str().unwrap());
+        let (json_size, jsonb_size) = perform_encoding(
+            &file_name.to_str().unwrap(),
+            output.to_str().unwrap(),
+            compression_level,
+        );
 
         json_sizes.push((json_size, jsonb_size));
     }
@@ -55,24 +63,56 @@ fn display_compression_ratio(json_size: usize, compressed_size: usize) {
     let (correct_value, correct_unit) = display_correct_value(compressed_size);
     let (json_value, json_unit) = display_correct_value(json_size);
 
+    let color = RGB(160, 160, 160);
+
+    print!("[{}] ", Green.bold().paint("RES"));
+    println!("{}", color.paint("Compression ratio:"));
+
     println!(
-        "Compression ratio: {} ({}) versus {} ({}). Ratio {:.2}",
-        correct_value,
-        correct_unit,
-        json_value,
-        json_unit,
-        if compressed_size == 0 {
-            0.0
-        } else {
-            json_size as f64 / compressed_size as f64
-        },
+        "  {} {} {}{}",
+        RGB(70, 70, 70).paint("==>"),
+        color.paint("JSON input size:"),
+        Style::new().bold().paint(json_value.to_string()),
+        json_unit
+    );
+
+    println!(
+        "  {} {} {}{}",
+        RGB(70, 70, 70).paint("==>"),
+        color.paint("Compressed size:"),
+        Style::new().bold().paint(correct_value.to_string()),
+        correct_unit
+    );
+
+    println!(
+        "  {} {} {}",
+        RGB(70, 70, 70).paint("==>"),
+        color.paint("Compression ratio:"),
+        Style::new().bold().paint(format!(
+            "{:.2}",
+            if compressed_size == 0 {
+                0.0
+            } else {
+                json_size as f64 / compressed_size as f64
+            }
+        )),
     );
 }
 
-fn perform_encoding(file_name: &str, output_path: &str) -> (usize, usize) {
-    let data = std::fs::read_to_string(file_name).unwrap();
+fn debug_with_color<T1: Display, T2: Display>(level: T1, message: T2) {
+    println!(
+        "[{}] {}",
+        Green.bold().paint(level.to_string()),
+        RGB(160, 160, 160).paint(message.to_string())
+    );
+}
 
-    let v = serde_json::from_str::<Value>(&data);
+fn perform_encoding(file_name: &str, output_path: &str, compression_level: i32) -> (usize, usize) {
+    let mut data = std::fs::read_to_string(file_name).unwrap();
+
+    debug_with_color("0/8", "Reading input file");
+
+    let v = unsafe { from_str(&mut data) };
 
     if let Err(e) = v {
         panic!("Failed to parse JSON: {}", e);
@@ -80,38 +120,58 @@ fn perform_encoding(file_name: &str, output_path: &str) -> (usize, usize) {
 
     let v = v.unwrap();
 
-    debug!("[1] Converting JSON to MLIR");
+    debug_with_color("1/8", "Converting JSON to MLIR");
     let mlir = jsonc_mlir::from_json(&v);
 
-    debug!("[2] Optimizing strings");
+    debug_with_color("2/8", "Optimizing strings");
     let mut str_optimizer = jsonc_string_opt::StringOptimizer::new();
     str_optimizer.traverse_and_collect_strings(&mlir);
     let optimized_mlir = str_optimizer.optimize(&mlir);
 
-    debug!("[3] Optimizing objects");
-    let mut obj_optimizer = jsonc_object_opt::ObjectOptimizer::new();
+    debug_with_color("3/8", "Optimizing objects");
+    let mut obj_optimizer = jsonc_object_opt::ObjectOptimizer::new_with_threshold(1);
+    obj_optimizer.build_frequencies(&optimized_mlir);
     let optimized_mlir = obj_optimizer.optimize(optimized_mlir, IS_ROOT);
     let formatted_mlir = obj_optimizer.format_output(optimized_mlir);
 
-    debug!("[4] Optimizing values");
+    debug_with_color("4/8", "Optimizing whole values");
     let mut value_optimizer = jsonc_value_opt::ValueOptimizer::new();
     let collected_mlir = value_optimizer.optimize_all(&formatted_mlir);
     let optimized_mlir = value_optimizer.optimize_program(collected_mlir);
 
-    debug!("[5] Creating lets");
+    debug_with_color("5/8", "Adding new let-nodes to MLIR");
     let lets = value_optimizer.create_lets();
 
-    let optimized_mlir = lets.into_iter().chain(optimized_mlir).collect::<Vec<_>>();
+    let mut functions = Vec::new();
+    let mut rest = Vec::new();
+    for node in optimized_mlir {
+        if matches!(node, jsonc_mlir::MLIR::MakeFunction { .. }) {
+            functions.push(node);
+        } else {
+            rest.push(node);
+        }
+    }
 
-    debug!("[6] Removing unused variables");
+    let optimized_mlir = functions
+        .into_iter()
+        .chain(lets)
+        .chain(rest)
+        .collect::<Vec<_>>();
+
+    debug_with_color("6/8", "Removing unused variables");
     let optimized_mlir = value_optimizer.remove_unused_variables(optimized_mlir);
 
     let mut compiler = jsonc_compiler::Compiler::new();
-    debug!("[7] Compiling to bytecode");
+    debug_with_color("7/8", "Compiling to bytecode");
     let bytecode = compiler.compile_all(optimized_mlir);
 
-    debug!("[8] Writing bytecode to file");
-    let _ = jsonc_encoder::write_instrs(&bytecode, &compiler.value_pool, output_path);
+    debug_with_color("8/8", "Writing bytecode to file");
+    let _ = jsonc_encoder::write_instrs(
+        &bytecode,
+        &compiler.value_pool,
+        output_path,
+        compression_level,
+    );
 
     // Compare size of json data and jsonb data
     let json_size = data.len();
@@ -123,23 +183,32 @@ fn perform_encoding(file_name: &str, output_path: &str) -> (usize, usize) {
 }
 
 fn perform_decoding(file_name: &str, output_path: &str) {
-    let mut decoder = jsonc_decoder::Decoder::new(vec![], vec![]);
-    let mut file = std::fs::File::open(file_name).unwrap();
-    let mut buf = Vec::new();
-    let _ = file.read_to_end(&mut buf);
+    let file_name = file_name.to_string();
+    let output_path = output_path.to_string();
 
-    match decoder.decode(buf) {
-        Ok(_) => match decoder.to_mlir() {
-            Ok(mlir) => {
-                let result = jsonc_mlir::multiple_to_json(&mlir, &mut HashMap::new());
-                let result = serde_json::to_string(&result).unwrap();
+    let builder = std::thread::Builder::new().stack_size(32 * 1024 * 1024);
+    let handler = builder
+        .spawn(move || {
+            let mut decoder = jsonc_decoder::Decoder::new(vec![], vec![]);
+            let mut file = std::fs::File::open(&file_name).unwrap();
+            let mut buf = Vec::new();
+            let _ = file.read_to_end(&mut buf);
 
-                std::fs::write(output_path, result).unwrap();
+            match decoder.decode(buf) {
+                Ok(_) => match decoder.to_mlir() {
+                    Ok(mlir) => {
+                        let result = jsonc_mlir::multiple_to_json(&mlir, &mut HashMap::new());
+                        let result = serde_json::to_string(&result).unwrap();
+
+                        std::fs::write(&output_path, result).unwrap();
+                    }
+                    Err(e) => display_error(e),
+                },
+                Err(e) => display_error(e),
             }
-            Err(e) => println!("Error: {:?}", e),
-        },
-        Err(e) => println!("Error: {:?}", e),
-    }
+        })
+        .unwrap();
+    handler.join().unwrap();
 }
 
 fn minify(input_path: &str, output_path: &str) {
@@ -153,16 +222,52 @@ fn minify(input_path: &str, output_path: &str) {
     std::fs::write(output_path, result).unwrap();
 }
 
+fn are_values_semantically_identical(v1: &serde_json::Value, v2: &serde_json::Value) -> bool {
+    match (v1, v2) {
+        (serde_json::Value::Null, serde_json::Value::Null) => true,
+        (serde_json::Value::Bool(b1), serde_json::Value::Bool(b2)) => b1 == b2,
+        (serde_json::Value::Number(n1), serde_json::Value::Number(n2)) => {
+            n1.as_f64() == n2.as_f64()
+        }
+        (serde_json::Value::String(s1), serde_json::Value::String(s2)) => s1 == s2,
+        (serde_json::Value::Array(a1), serde_json::Value::Array(a2)) => {
+            if a1.len() != a2.len() {
+                return false;
+            }
+            a1.iter()
+                .zip(a2.iter())
+                .all(|(x, y)| are_values_semantically_identical(x, y))
+        }
+        (serde_json::Value::Object(m1), serde_json::Value::Object(m2)) => {
+            if m1.len() != m2.len() {
+                return false;
+            }
+            for (k, val1) in m1 {
+                if let Some(val2) = m2.get(k) {
+                    if !are_values_semantically_identical(val1, val2) {
+                        return false;
+                    }
+                } else {
+                    return false;
+                }
+            }
+            true
+        }
+        _ => false,
+    }
+}
+
 fn compare_json_files(path1: &str, path2: &str) {
     let data1 = std::fs::read_to_string(path1).unwrap();
     let data2 = std::fs::read_to_string(path2).unwrap();
     let v1: serde_json::Value = serde_json::from_str(&data1).unwrap();
     let v2: serde_json::Value = serde_json::from_str(&data2).unwrap();
-    if v1 == v2 {
+    if are_values_semantically_identical(&v1, &v2) {
         println!("The JSON files are semantically identical!");
     } else {
         println!("The JSON files are DIFFERENT!");
         diff_values(&v1, &v2, "");
+        std::process::exit(1);
     }
 }
 
@@ -197,6 +302,11 @@ fn diff_values(v1: &serde_json::Value, v2: &serde_json::Value, path: &str) {
                 diff_values(&a1[i], &a2[i], &format!("{}[{}]", path, i));
             }
         }
+        (serde_json::Value::Number(n1), serde_json::Value::Number(n2)) => {
+            if n1.as_f64() != n2.as_f64() {
+                println!("Difference at {}: {:?} vs {:?}", path, n1, n2);
+            }
+        }
         (val1, val2) => {
             if val1 != val2 {
                 println!("Difference at {}: {:?} vs {:?}", path, val1, val2);
@@ -220,7 +330,13 @@ fn main() {
                 )
                 .arg(
                     clap::arg!(--"output" <PATH>)
+                        .short('o')
                         .value_parser(clap::value_parser!(std::path::PathBuf)),
+                )
+                .arg(
+                    clap::arg!(--"compression-level" <LEVEL>)
+                        .short('l')
+                        .value_parser(clap::value_parser!(i32)),
                 ),
         )
         .subcommand(
@@ -233,16 +349,23 @@ fn main() {
                 )
                 .arg(
                     clap::arg!(--"output" <PATH>)
+                        .short('o')
                         .value_parser(clap::value_parser!(std::path::PathBuf)),
                 ),
         )
         .subcommand(
-            clap::command!("benchmark").arg(
-                clap::Arg::new("input")
-                    .required(true)
-                    .index(1)
-                    .value_parser(clap::value_parser!(std::path::PathBuf)),
-            ),
+            clap::command!("benchmark")
+                .arg(
+                    clap::Arg::new("input")
+                        .required(true)
+                        .index(1)
+                        .value_parser(clap::value_parser!(std::path::PathBuf)),
+                )
+                .arg(
+                    clap::arg!(--"compression-level" <LEVEL>)
+                        .short('l')
+                        .value_parser(clap::value_parser!(i32)),
+                ),
         )
         .subcommand(
             clap::command!("minify").arg(
@@ -299,12 +422,22 @@ fn main() {
                 "json"
             })
         });
+    let compression_level = if ["encode", "benchmark"].contains(&matches.0) {
+        matches
+            .1
+            .get_one::<i32>("compression-level")
+            .copied()
+            .unwrap_or(9)
+    } else {
+        0
+    };
 
     match matches.0 {
         "encode" => {
             perform_encoding(
                 input_path.unwrap().to_str().unwrap(),
                 output_path.to_str().unwrap(),
+                compression_level,
             );
         }
         "decode" => perform_decoding(
@@ -312,7 +445,7 @@ fn main() {
             output_path.to_str().unwrap(),
         ),
         "benchmark" => {
-            benchmark(input_path.unwrap().to_str().unwrap());
+            benchmark(input_path.unwrap().to_str().unwrap(), compression_level);
         }
         "minify" => {
             minify(
